@@ -67,7 +67,7 @@ class Mesh:
 
 RED = RGBA(1, 0, 0, 1)
 GREEN = RGBA(0, 1, 0, 1)
-BLUE = RGBA(0, 0, 1, 0.1)
+BLUE = RGBA(0, 0, 1, 1)
 BLACK = RGBA(0, 0, 0, 1)
 WHITE = RGBA(1, 1, 1, 1)
 BROWN = RGBA(0.396, 0.263, 0.129, 1)
@@ -926,7 +926,7 @@ def create_visual_shape(
         return NULL_ID
     point, quat = pose
     visual_args = {
-        "rgbaColor": color,
+        "rgbaColor": list(color),
         "visualFramePosition": point,
         "visualFrameOrientation": quat,
     }
