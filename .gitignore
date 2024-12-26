@@ -1,9 +1,5 @@
-<<<<<<< HEAD
-__pycache__/
-=======
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
 *$py.class
 .DS_STORE
->>>>>>> db7167e (updates)
