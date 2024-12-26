@@ -5,13 +5,15 @@ import math
 import os
 import platform
 import random
+import sys
 import time
 from dataclasses import asdict, dataclass
 from typing import Any, List, Optional, Tuple
 
 import numpy as np
 import pybullet as p
-from scipy.interpolate import CubicSpline, interp1d, make_interp_spline, make_lsq_spline
+from scipy.interpolate import (CubicSpline, interp1d, make_interp_spline,
+                               make_lsq_spline)
 from scipy.spatial import ConvexHull
 from scipy.spatial.transform import Rotation as R
 
@@ -32,6 +34,7 @@ GRASP_LENGTH = 0.04
 MAX_GRASP_WIDTH = np.inf
 DEFAULT_SPEED_FRACTION = 0.3
 _EPS = np.finfo(float).eps * 4.0
+GRAVITY = 9.8
 
 
 @dataclass
@@ -40,8 +43,8 @@ class RGB:
     green: int
     blue: int
 
-    def __list__(self):
-        return [self.red, self.green, self.blue]
+    def __iter__(self):
+        return iter(asdict(self).values())
 
 
 @dataclass
@@ -71,6 +74,19 @@ TAN = RGBA(0.824, 0.706, 0.549, 1)
 GREY = RGBA(0.5, 0.5, 0.5, 1)
 YELLOW = RGBA(1, 1, 0, 1)
 TRANSPARENT = RGBA(0, 0, 0, 0)
+LIGHT_GREY = RGBA(0.75, 0.75, 0.75, 1)
+
+ACHROMATIC_COLORS = {
+    "white": WHITE,
+    "grey": GREY,
+    "black": BLACK,
+}
+
+CHROMATIC_COLORS = {
+    "red": RED,
+    "green": GREEN,
+    "blue": BLUE,
+}
 
 
 @dataclass
@@ -89,8 +105,25 @@ def angle_between(vec1, vec2):
     return math.acos(clip(inner_product, min_value=-1.0, max_value=+1.0))
 
 
+def get_image_aabb(camera_matrix):
+    upper = np.array(dimensions_from_camera_matrix(camera_matrix)) - 1
+    lower = np.zeros(upper.shape)
+    return AABB(lower, upper)
+
+
+def get_aabb_volume(aabb):
+    if aabb_empty(aabb):
+        return 0.0
+    return np.prod(get_aabb_extent(aabb))
+
+
 def quat_from_euler(euler):
     return p.getQuaternionFromEuler(euler)
+
+
+def pose_from_pose2d(pose2d, z=0.0):
+    x, y, theta = pose2d
+    return Pose(Point(x=x, y=y, z=z), Euler(yaw=theta))
 
 
 def Euler(roll: float = 0.0, pitch: float = 0.0, yaw: float = 0.0):
@@ -99,6 +132,10 @@ def Euler(roll: float = 0.0, pitch: float = 0.0, yaw: float = 0.0):
 
 def Point(x=0.0, y=0.0, z=0.0):
     return np.array([x, y, z])
+
+
+def ray_from_pixel(camera_matrix, pixel):
+    return np.linalg.inv(camera_matrix).dot(np.append(pixel, 1))
 
 
 def Pose(point: Point = None, euler: Euler = None):
@@ -360,16 +397,22 @@ def add_ramp_waypoints(
     return waypoints, time_from_starts
 
 
+def set_texture(body, texture=None, link=BASE_LINK, shape_index=NULL_ID, client=None):
+    client = client or DEFAULT_CLIENT
+    if texture is None:
+        texture = NULL_ID
+    return client.changeVisualShape(
+        body,
+        link,
+        shapeIndex=shape_index,
+        textureUniqueId=texture,
+        physicsClientId=CLIENT,
+    )
+
+
 def ramp_retime_path(
     path, max_velocities, acceleration_fraction=np.inf, sample_step=None, **kwargs
 ):
-    """
-    :param path:
-    :param max_velocities:
-    :param acceleration_fraction: fraction of velocity_fraction*max_velocity per second
-    :param sample_step:
-    :return:
-    """
     assert np.all(max_velocities)
     accelerations = max_velocities * acceleration_fraction
     dim = len(max_velocities)
@@ -450,17 +493,12 @@ def approximate_spline(time_from_starts, path, k=3, approx=np.inf):
         )
         positions.x = positions.t[positions.k : -positions.k]
     else:
-        # TODO: approximation near the endpoints
-        # approx = min(approx, len(x) - 2*k)
         assert approx <= len(x) - 2 * k
         t = np.r_[
             (x[0],) * (k + 1),
-            # np.linspace(x[0]+1e-3, x[-1]-1e-3, num=approx, endpoint=True),
             np.linspace(x[0], x[-1], num=2 + approx, endpoint=True)[1:-1],
             (x[-1],) * (k + 1),
         ]
-        # t = positions.t # Need to slice
-        # w = np.zeros(...)
         w = None
         positions = make_lsq_spline(x, path, t, k=k, w=w)
     positions.x = positions.t[positions.k : -positions.k]
@@ -506,10 +544,33 @@ def interpolate_path(
     accelerations = positions.derivative()
     for i, t in enumerate(positions.x):
         print(i, round(t, 3), positions(t), velocities(t), accelerations(t))
-    # TODO: compose piecewise functions
-    # TODO: ramp up and ramp down path
-    # TODO: quadratic interpolation between endpoints
+
     return positions
+
+
+def get_base_name(body, **kwargs):
+    return get_body_info(body, **kwargs).base_name.decode(encoding="UTF-8")
+
+
+def get_body_name(body, **kwargs):
+    return get_body_info(body, **kwargs).body_name.decode(encoding="UTF-8")
+
+
+def get_name(body, **kwargs):
+    name = get_body_name(body, **kwargs)
+    if name == "":
+        name = "body"
+    return "{}{}".format(name, int(body))
+
+
+def add_body_name(body, name=None, **kwargs):
+    if name is None:
+        name = get_name(body, **kwargs)
+    with PoseSaver(body, **kwargs):
+        set_pose(body, unit_pose(), **kwargs)
+        aabb = get_aabb(body, **kwargs)
+    position = aabb.upper
+    return add_text(name, position=position, parent=body, **kwargs)
 
 
 def waypoints_from_path(path, difference_fn=None, tolerance=1e-3):
@@ -752,6 +813,44 @@ def create_box(w, l, h, mass=STATIC_MASS, color=RED, **kwargs):
     return create_body(collision_id, visual_id, mass=mass, **kwargs)
 
 
+def get_cylinder_geometry(radius, height):
+    return {
+        "shapeType": p.GEOM_CYLINDER,
+        "radius": radius,
+        "length": height,
+    }
+
+
+def get_sphere_geometry(radius):
+    return {
+        "shapeType": p.GEOM_SPHERE,
+        "radius": radius,
+    }
+
+
+def get_capsule_geometry(radius, height):
+    return {
+        "shapeType": p.GEOM_CAPSULE,
+        "radius": radius,
+        "length": height,
+    }
+
+
+def get_plane_geometry(normal):
+    return {
+        "shapeType": p.GEOM_PLANE,
+        "planeNormal": normal,
+    }
+
+
+def get_mesh_geometry(path, scale=1.0):
+    return {
+        "shapeType": p.GEOM_MESH,
+        "fileName": path,
+        "meshScale": scale * np.ones(3),
+    }
+
+
 def join_paths(*paths):
     return os.path.abspath(os.path.join(*paths))
 
@@ -920,14 +1019,6 @@ def set_dynamics(body, link=BASE_LINK, client=None, **kwargs):
     # TODO: iterate over all links
     client = client or DEFAULT_CLIENT
     client.changeDynamics(int(body), link)
-
-
-def get_mesh_geometry(path, scale=1.0):
-    return {
-        "shapeType": p.GEOM_MESH,
-        "fileName": path,
-        "meshScale": scale * np.ones(3),
-    }
 
 
 def apply_alpha(color, alpha=1.0):
@@ -1114,14 +1205,14 @@ def get_aabbs(body, links=None, only_collision=True, **kwargs):
     return [get_aabb(body, link=link, **kwargs) for link in links]
 
 
-def aabb_union(aabbs: list):
+def aabb_union(aabbs: list[AABB]):
     if not aabbs:
         return None
     if len(aabbs) == 1:
         return aabbs[0]
-    d = len(aabbs[0][0])
-    lower = [min(aabb[0][k] for aabb in aabbs) for k in range(d)]
-    upper = [max(aabb[1][k] for aabb in aabbs) for k in range(d)]
+    d = len(aabbs[0].lower)
+    lower = [min(aabb.lower[k] for aabb in aabbs) for k in range(d)]
+    upper = [max(aabb.upper[k] for aabb in aabbs) for k in range(d)]
     return AABB(lower, upper)
 
 
@@ -1150,6 +1241,204 @@ def any_link_pair_collision(body1, links1, body2, links2=None, **kwargs):
     return False
 
 
+def dict_from_kwargs(**kwargs):
+    return kwargs
+
+
+def get_control_joint_kwargs(
+    body,
+    joint,
+    position_gain=None,
+    max_velocity=None,
+    velocity_scale=None,
+    max_force=None,
+):
+    kwargs = {}
+    if position_gain is not None:
+        velocity_gain = 0.1 * position_gain
+        kwargs.update(
+            {
+                "positionGain": position_gain,
+                "velocityGain": velocity_gain,
+            }
+        )
+    if velocity_scale is not None:
+        max_velocity = velocity_scale * get_max_velocity(body, joint)
+        kwargs.update(
+            {
+                "maxVelocity": max_velocity,
+            }
+        )
+    if max_velocity is not None:
+        kwargs.update(dict_from_kwargs(maxVelocity=max_velocity))
+    if max_force is not None:
+        kwargs.update(
+            {
+                "force": max_force,
+            }
+        )
+    return kwargs
+
+
+def get_duration_fn(body, joints, velocities=None, norm=np.inf, **kwargs):
+    if velocities is None:
+        velocities = np.array(get_max_velocities(body, joints, **kwargs))
+    difference_fn = get_difference_fn(body, joints, **kwargs)
+
+    def fn(q1, q2):
+        distances = np.array(difference_fn(q2, q1))
+        durations = np.divide(distances, np.abs(velocities))
+        return np.linalg.norm(durations, ord=norm)
+
+    return fn
+
+
+def waypoint_joint_controller(
+    body, joints, target, tolerance=1e-3, time_step=0.1, timeout=np.inf, **kwargs
+):
+    assert len(joints) == len(target)
+    duration_fn = get_duration_fn(body, joints, **kwargs)
+    dt = get_time_step(**kwargs)
+    time_elapsed = 0.0
+    while time_elapsed < timeout:
+        positions = get_joint_positions(body, joints, **kwargs)
+        remaining = duration_fn(positions, target)
+        if all_close(positions, target, atol=tolerance):
+            break
+        w = min(remaining, time_step) / remaining
+        waypoint = convex_combination(positions, target, w=w)
+        control_joints(body, joints, waypoint, **kwargs)
+        yield positions
+        time_elapsed += dt
+
+
+def control_joint(body, joint, position=None, velocity=0.0, client=None, **kwargs):
+    if position is None:
+        position = get_joint_position(body, joint)  # TODO: remove?
+    joint_kwargs = get_control_joint_kwargs(body, joint, **kwargs)
+    return client.setJointMotorControl2(
+        bodyIndex=int(body),  # bodyUniqueId
+        jointIndex=joint,
+        controlMode=p.POSITION_CONTROL,
+        targetPosition=position,
+        targetVelocity=velocity,  # Note that the targetVelocity is not the maximum joint velocity
+        **joint_kwargs,
+    )
+
+
+def velocity_control_joint(body, joint, velocity=0.0, client=None, **kwargs):
+    joint_kwargs = get_control_joint_kwargs(body, joint, **kwargs)
+    return client.setJointMotorControl2(
+        int(body),
+        joint,
+        p.VELOCITY_CONTROL,
+        targetVelocity=velocity,  # Note that the targetVelocity is not the maximum joint velocity
+        **joint_kwargs,
+    )
+
+
+def control_joints(
+    body,
+    joints,
+    positions=None,
+    velocities=None,
+    position_gain=None,
+    velocity_scale=None,
+    max_force=None,
+    client=None,
+    **kwargs,
+):
+    if positions is None:
+        positions = get_joint_positions(body, joints, client=client)
+    if velocities is None:
+        velocities = [0.0] * len(joints)
+
+    if velocity_scale is not None:
+        for i, joint in enumerate(joints):
+            control_joint(
+                body,
+                joint,
+                position=positions[i],
+                velocity=velocities[i],
+                position_gain=position_gain,
+                velocity_scale=velocity_scale,
+                max_force=max_force,
+                client=client,
+            )
+        return None
+
+    kwargs = {}
+    if position_gain is not None:
+        velocity_gain = 0.1 * position_gain
+        kwargs.update(
+            {
+                "positionGains": [position_gain] * len(joints),
+                "velocityGains": [velocity_gain] * len(joints),
+            }
+        )
+    if max_force is not None:
+        # max_forces = [get_max_force(body, joint) for joint in joints]
+        max_forces = [max_force] * len(joints)
+        # max_forces = [5000]*len(joints) # 20000
+        # print(max_forces)
+        kwargs.update(
+            {
+                "forces": max_forces,
+            }
+        )
+    return client.setJointMotorControlArray(
+        bodyUniqueId=int(body),
+        jointIndices=joints,
+        controlMode=p.POSITION_CONTROL,
+        targetPositions=positions,
+        targetVelocities=velocities,
+        **kwargs,
+    )
+
+
+def simulate_controller(
+    controller, max_time=np.inf, **kwargs
+):  # Allow option to sleep rather than yield?
+    # TODO: deprecate
+    sim_dt = get_time_step(**kwargs)
+    sim_time = 0.0
+    for _ in controller:
+        if max_time < sim_time:
+            break
+        step_simulation(**kwargs)
+        sim_time += sim_dt
+        yield sim_time
+
+
+def step_simulation(client=None, **kwargs):
+    client = client or DEFAULT_CLIENT
+    client.stepSimulation()
+
+
+def aabb_contains_point(point, aabb: AABB):
+    return (
+        np.less_equal(aabb.lower, point).all()
+        and np.less_equal(point, aabb.upper).all()
+    )
+
+
+def oobb_contains_point(point, container: OOBB):
+    return aabb_contains_point(
+        tform_point(invert(container.pose), point), container.aabb
+    )
+
+
+def get_oobb_vertices(oobb: OOBB):
+    return tform_points(oobb.pose, get_aabb_vertices(oobb.aabb))
+
+
+def create_cylinder(radius, height, mass=STATIC_MASS, color=BLUE, **kwargs):
+    collision_id, visual_id = create_shape(
+        get_cylinder_geometry(radius, height), color=color, **kwargs
+    )
+    return create_body(collision_id, visual_id, mass=mass, **kwargs)
+
+
 def expand_links(body, **kwargs):
     body, links = parse_body(body)
     if links is None:
@@ -1158,10 +1447,13 @@ def expand_links(body, **kwargs):
 
 
 def pairwise_collision(body1, body2, **kwargs):
-    if isinstance(body1, tuple) or isinstance(body2, tuple):
-        body1, links1 = expand_links(body1, **kwargs)
-        body2, links2 = expand_links(body2, **kwargs)
-        return any_link_pair_collision(body1, links1, body2, links2, **kwargs)
+    if isinstance(body1, CollisionPair) or isinstance(body2, CollisionPair):
+        pair1 = expand_links(body1, **kwargs)
+        pair2 = expand_links(body2, **kwargs)
+        return any_link_pair_collision(
+            pair1.body, pair1.links, pair2.body, pair2.links, **kwargs
+        )
+
     return body_collision(body1, body2, **kwargs)
 
 
@@ -1695,8 +1987,7 @@ def get_length(vec, norm=2):
 
 
 def get_difference(p1, p2):
-    assert len(p1) == len(p2)
-    return np.array(p2) - np.array(p1)
+    return np.array(list(p2)) - np.array(list(p1))
 
 
 def get_distance(p1, p2, **kwargs):
@@ -2461,7 +2752,7 @@ def add_text(
     return client.addUserDebugText(
         str(text),
         textPosition=position,
-        textColorRGB=color[:3],  # textSize=1,
+        textColorRGB=list(color)[:3],  # textSize=1,
         lifeTime=get_lifetime(lifetime),
         parentObjectUniqueId=parent,
         parentLinkIndex=parent_link,
@@ -2507,8 +2798,6 @@ def draw_point(point, size=0.01, **kwargs):
 def draw_collision_info(collision_info, **kwargs):
     point1 = collision_info.positionOnA
     point2 = collision_info.positionOnB
-    # direction = np.array(collision_info.contactNormalOnB)*collision_info.contactDistance
-    # assert np.allclose(point1, point2 + direction)
     handles = [add_line(point1, point2, **kwargs)]
     for point in [point1, point2]:
         handles.extend(draw_point(point, **kwargs))
@@ -2516,14 +2805,11 @@ def draw_collision_info(collision_info, **kwargs):
 
 
 class State(object):
-    # TODO: apply context to the trajectories
     def __init__(self, attachments={}):
         self.attachments = dict(attachments)
 
     def propagate(self, **kwargs):
-        # Derived values
         for relative_pose in self.attachments.values():
-            # TODO: topological sort
             relative_pose.assign(**kwargs)
 
     def copy(self):  # update
@@ -2755,14 +3041,62 @@ def uniform_pose_generator(robot, gripper_pose, **kwargs):
         yield base_values
 
 
-def aabb_empty(aabb):
-    lower, upper = aabb
-    return np.less(upper, lower).any()
+def custom_limits_from_base_limits(robot, base_limits, yaw_limit=None, **kwargs):
+    # TODO: unify with SS-Replan
+    x_limits, y_limits = zip(*base_limits)
+    custom_limits = {
+        joint_from_name(robot, "x", **kwargs): x_limits,
+        joint_from_name(robot, "y", **kwargs): y_limits,
+    }
+    if yaw_limit is not None:
+        custom_limits.update(
+            {
+                joint_from_name(robot, "theta", **kwargs): yaw_limit,
+            }
+        )
+    return custom_limits
 
 
-def sample_aabb(aabb):
-    lower, upper = aabb
-    return np.random.uniform(lower, upper)
+def remove_alpha(color):
+    return RGB(*color[:3])
+
+
+def tform_oobb(affine, oobb: OOBB):
+    return OOBB(oobb.aabb, multiply(affine, oobb.pose))
+
+
+def convex_centroid(vertices):
+    # TODO: also applies to non-overlapping polygons
+    vertices = [np.array(v[:2]) for v in vertices]
+    segments = get_wrapped_pairs(vertices)
+    return sum((v1 + v2) * np.cross(v1, v2) for v1, v2 in segments) / (
+        6.0 * convex_signed_area(vertices)
+    )
+
+
+def aabb_empty(aabb: AABB):
+    return np.less(aabb.upper, aabb.lower).any()
+
+
+def sample_aabb(aabb: AABB):
+    return np.random.uniform(aabb.lower, aabb.upper)
+
+
+def convex_area(vertices):
+    return abs(convex_signed_area(vertices))
+
+
+def get_wrapped_pairs(sequence):
+    sequence = list(sequence)
+    return safe_zip(sequence, sequence[1:] + sequence[:1])
+
+
+def convex_signed_area(vertices):
+    if len(vertices) < 3:
+        return 0.0
+    vertices = [np.array(v[:2]) for v in vertices]
+    segments = get_wrapped_pairs(vertices)
+    return sum(np.cross(v1, v2) for v1, v2 in segments) / 2.0
 
 
 def sample_placement_on_aabb(
@@ -2903,11 +3237,26 @@ def inverse_kinematics(
     return kinematic_conf
 
 
-def recenter_oobb(oobb):
-    aabb, pose = oobb
-    extent = get_aabb_extent(aabb)
+def get_extend_fn(body, joints, resolutions=None, norm=2, **kwargs):
+    # norm = 1, 2, INF
+    resolutions = get_default_resolutions(body, joints, resolutions, **kwargs)
+    difference_fn = get_difference_fn(body, joints, **kwargs)
+
+    def fn(q1, q2):
+        # steps = int(np.max(np.abs(np.divide(difference_fn(q2, q1), resolutions))))
+        steps = int(
+            np.linalg.norm(np.divide(difference_fn(q2, q1), resolutions), ord=norm)
+        )
+        refine_fn = get_refine_fn(body, joints, num_steps=steps, **kwargs)
+        return refine_fn(q1, q2)
+
+    return fn
+
+
+def recenter_oobb(oobb: OOBB):
+    extent = get_aabb_extent(oobb.aabb)
     new_aabb = AABB(-extent / 2.0, +extent / 2.0)
-    return OOBB(new_aabb, multiply(pose, Pose(point=get_aabb_center(aabb))))
+    return OOBB(new_aabb, multiply(oobb.pose, Pose(point=get_aabb_center(oobb.aabb))))
 
 
 def scale_aabb(aabb, scale):
@@ -3008,10 +3357,201 @@ def get_self_link_pairs(
     return check_link_pairs
 
 
+def cached_fn(fn, cache=True, **global_kargs):
+    def normal(*args, **local_kwargs):
+        kwargs = dict(global_kargs)
+        kwargs.update(local_kwargs)
+        return fn(*args, **kwargs)
+
+    if not cache:
+        return normal
+
+    try:
+        from functools import lru_cache as cache
+
+        @cache(maxsize=None, typed=False)
+        def wrapped(*args, **local_kwargs):
+            return normal(*args, **local_kwargs)
+
+        return wrapped
+    except ImportError:
+        pass
+
+    key_fn = id
+    cache = {}
+
+    def wrapped(*args, **local_kwargs):
+        args_key = tuple(map(key_fn, args))
+        local_kwargs_key = frozenset(
+            {key: key_fn(value) for key, value in local_kwargs.items()}.items()
+        )
+        key = (args_key, local_kwargs_key)
+        if key not in cache:
+            cache[key] = normal(*args, **local_kwargs)
+        return cache[key]
+
+    return wrapped
+
+
+def get_collision_fn(
+    body,
+    joints,
+    obstacles=[],
+    attachments=[],
+    self_collisions=True,
+    disabled_collisions=set(),
+    custom_limits={},
+    use_aabb=False,
+    cache=False,
+    max_distance=MAX_DISTANCE,
+    extra_collisions=None,
+    **kwargs,
+):
+    check_link_pairs = (
+        get_self_link_pairs(body, joints, disabled_collisions, **kwargs)
+        if self_collisions
+        else []
+    )
+    moving_links = frozenset(
+        link
+        for link in get_moving_links(body, joints, **kwargs)
+        if can_collide(body, link, **kwargs)
+    )
+    attached_bodies = [attachment.child for attachment in attachments]
+    moving_bodies = [CollisionPair(body, moving_links)] + list(
+        map(parse_body, attached_bodies)
+    )
+    get_obstacle_aabb = cached_fn(
+        get_buffered_aabb, cache=cache, max_distance=max_distance / 2.0, **kwargs
+    )
+    limits_fn = get_limits_fn(body, joints, custom_limits=custom_limits, **kwargs)
+
+    def collision_fn(q, verbose=False):
+        if limits_fn(q):
+            return True
+
+        set_joint_positions(body, joints, q, **kwargs)
+
+        for attachment in attachments:
+            attachment.assign(**kwargs)
+
+        if extra_collisions is not None and extra_collisions(**kwargs):
+            return True
+
+        get_moving_aabb = cached_fn(
+            get_buffered_aabb, cache=True, max_distance=max_distance / 2.0, **kwargs
+        )
+
+        for link1, link2 in check_link_pairs:
+            if (
+                not use_aabb
+                or aabb_overlap(get_moving_aabb(body), get_moving_aabb(body))
+            ) and pairwise_link_collision(body, link1, body, link2, **kwargs):
+                return True
+
+        for body1, body2 in itertools.product(moving_bodies, obstacles):
+            if (
+                not use_aabb
+                or aabb_overlap(get_moving_aabb(body1), get_obstacle_aabb(body2))
+            ) and pairwise_collision(body1, body2, **kwargs):
+                return True
+        return False
+
+    return collision_fn
+
+
 def get_default_weights(body, joints, weights=None):
     if weights is not None:
         return weights
     return 1 * np.ones(len(joints))
+
+
+def get_distance_fn(body, joints, weights=None, norm=2, **kwargs):
+    weights = get_default_weights(body, joints, weights)
+    difference_fn = get_difference_fn(body, joints, **kwargs)
+
+    def fn(q1, q2):
+        diff = np.array(difference_fn(q2, q1))
+        if norm == 2:
+            return np.sqrt(np.dot(weights, diff * diff))
+        return np.linalg.norm(np.multiply(weights, diff), ord=norm)
+
+    return fn
+
+
+def check_initial_end(
+    body, joints, start_conf, end_conf, collision_fn, verbose=True, **kwargs
+):
+    # TODO: collision_fn might not accept kwargs
+    if collision_fn(start_conf, verbose=verbose):
+        set_joint_positions(body, joints, start_conf, **kwargs)
+        print("Warning: initial configuration is in collision")
+        wait_if_gui(**kwargs)
+        return False
+    if collision_fn(end_conf, verbose=verbose):
+        set_joint_positions(body, joints, end_conf, **kwargs)
+        print("Warning: end configuration is in collision")
+        wait_if_gui(**kwargs)
+        return False
+    return True
+
+
+def plan_joint_motion(
+    body,
+    joints,
+    end_conf,
+    obstacles=[],
+    attachments=[],
+    self_collisions=True,
+    disabled_collisions=set(),
+    weights=None,
+    resolutions=None,
+    max_distance=MAX_DISTANCE,
+    use_aabb=False,
+    cache=True,
+    custom_limits={},
+    algorithm=None,
+    disable_collisions=False,
+    extra_collisions=None,
+    **kwargs,
+):
+    assert len(joints) == len(end_conf)
+    if (weights is None) and (resolutions is not None):
+        weights = np.reciprocal(resolutions)
+    sample_fn = get_sample_fn(body, joints, custom_limits=custom_limits, **kwargs)
+    distance_fn = get_distance_fn(body, joints, weights=weights, **kwargs)
+    extend_fn = get_extend_fn(body, joints, resolutions=resolutions, **kwargs)
+    collision_fn = get_collision_fn(
+        body,
+        joints,
+        obstacles,
+        attachments,
+        self_collisions,
+        disabled_collisions,
+        custom_limits=custom_limits,
+        max_distance=max_distance,
+        use_aabb=use_aabb,
+        cache=cache,
+        disable_collisions=disable_collisions,
+        extra_collisions=extra_collisions,
+        **kwargs,
+    )
+
+    start_conf = get_joint_positions(body, joints, **kwargs)
+    if not check_initial_end(
+        body, joints, start_conf, end_conf, collision_fn, **kwargs
+    ):
+        return None
+
+    return birrt(
+        start_conf,
+        end_conf,
+        distance_fn,
+        sample_fn,
+        extend_fn,
+        collision_fn,
+        **kwargs,
+    )
 
 
 def euler_from_quat(quat):
@@ -3170,3 +3710,44 @@ def step_curve(robot, joints, curve, time_step=2e-2, print_freq=None, **kwargs):
                 num_steps, time_elapsed, elapsed_time(start_time)
             )
         )
+
+
+class HideOutput(object):
+    # https://stackoverflow.com/questions/5081657/how-do-i-prevent-a-c-shared-library-to-print-on-stdout-in-python
+    # https://stackoverflow.com/questions/4178614/suppressing-output-of-module-calling-outside-library
+    # https://stackoverflow.com/questions/4675728/redirect-stdout-to-a-file-in-python/22434262#22434262
+    """A context manager that block stdout for its scope, usage:
+
+    with HideOutput():     os.system('ls -l')
+    """
+    DEFAULT_ENABLE = True
+
+    def __init__(self, enable=None):
+        if enable is None:
+            enable = self.DEFAULT_ENABLE
+        self.enable = enable
+        if not self.enable:
+            return
+        sys.stdout.flush()
+        self._origstdout = sys.stdout
+        self._oldstdout_fno = os.dup(sys.stdout.fileno())
+        self._devnull = os.open(os.devnull, os.O_WRONLY)
+
+    def __enter__(self):
+        if not self.enable:
+            return
+        self.fd = 1
+        # self.fd = sys.stdout.fileno()
+        self._newstdout = os.dup(self.fd)
+        os.dup2(self._devnull, self.fd)
+        os.close(self._devnull)
+        sys.stdout = os.fdopen(self._newstdout, "w")
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if not self.enable:
+            return
+        sys.stdout.close()
+        sys.stdout = self._origstdout
+        sys.stdout.flush()
+        os.dup2(self._oldstdout_fno, self.fd)
+        os.close(self._oldstdout_fno)  # Added

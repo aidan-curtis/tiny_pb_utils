@@ -3,7 +3,7 @@
 import pybullet_utils.bullet_client as bc
 import pybullet as p
 import pb_utils as pbu
-
+import numpy as np
 
 if __name__ == '__main__':
     client = bc.BulletClient(connection_mode=p.DIRECT)
